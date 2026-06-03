@@ -1,0 +1,61 @@
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.12
+
+# MongoDB — Motor (async driver) + Beanie (ODM)
+motor==3.6.0
+beanie==1.26.0
+pymongo==4.9.2
+
+# Async support
+anyio==4.7.0
+
+# Task scheduler
+apscheduler==3.10.4
+
+# Web scraping
+playwright==1.49.0
+beautifulsoup4==4.12.3
+lxml==5.3.0
+httpx==0.28.1
+aiohttp==3.11.10
+
+# OCR
+pytesseract==0.3.13
+Pillow==11.0.0
+google-cloud-vision==3.8.1
+
+# Data processing
+pandas==2.2.3
+numpy==1.26.4
+
+# Security & integrity
+cryptography==44.0.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+
+# Config & environment
+python-dotenv==1.0.1
+pydantic==2.10.3
+pydantic-settings==2.7.0
+
+# Caching
+redis==5.2.1
+
+# WebSockets
+websockets==14.1
+
+# Logging & monitoring
+structlog==24.4.0
+sentry-sdk[fastapi]==2.19.0
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.24.0
+factory-boy==3.3.1
+
+# Utilities
+python-slugify==8.0.4
+Shapely==2.0.6

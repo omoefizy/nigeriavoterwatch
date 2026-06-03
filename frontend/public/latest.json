@@ -1,0 +1,13 @@
+{
+  "generated_at": "2026-06-03T01:51:27.101213+00:00",
+  "scrape_id": "6a1f888a30fcffe93bdafb40",
+  "chain_tip_hash": "58bf2984dd65266f8b6d2bba43614b7a1a163fc08729b523bc2faf8b5fbed9b6",
+  "chain_tip_sequence": 0,
+  "summary": {
+    "total_polling_units": 0,
+    "images_downloaded": 0,
+    "missing_url": 0,
+    "broken_url": 0
+  },
+  "states": []
+}

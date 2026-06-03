@@ -1,0 +1,45 @@
+# NigeriaVoteWatch — Docker Compose
+#
+# Database: MongoDB Atlas (cloud-hosted, free tier)
+# ─────────────────────────────────────────────────────
+# Set MONGODB_URI in your .env file:
+#
+#   MONGODB_URI=mongodb+srv://<user>:<password>@<cluster>.mongodb.net/nigeriavoterwatch?retryWrites=true&w=majority
+#
+# Atlas free tier (M0) provides 512 MB storage and is sufficient for
+# development. Create a cluster at https://cloud.mongodb.com, allowlist
+# your IP (or 0.0.0.0/0 for dev), and copy the connection string above.
+#
+# Redis is not used in the current architecture (caching is handled
+# at the application layer via in-process state where needed).
+
+version: "3.9"
+
+services:
+  backend:
+    build:
+      context: ../backend
+      dockerfile: ../docker/Dockerfile.backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - ../.env
+    volumes:
+      - ../backend:/app
+      - uploads:/app/uploads
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: ../docker/Dockerfile.frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      VITE_API_URL: http://localhost:8000
+    depends_on:
+      - backend
+
+volumes:
+  uploads:
