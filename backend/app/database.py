@@ -28,7 +28,14 @@ async def init_db() -> motor.motor_asyncio.AsyncIOMotorClient:
     from app.models.scrape_log import IRevScrapeRun, ScrapeLogEntry
     from app.models.user import User
 
-    _motor_client = motor.motor_asyncio.AsyncIOMotorClient(settings.mongodb_uri)
+    _motor_client = motor.motor_asyncio.AsyncIOMotorClient(
+        settings.mongodb_uri,
+        tls=True,
+        tlsAllowInvalidCertificates=False,
+        serverSelectionTimeoutMS=30000,
+        connectTimeoutMS=20000,
+        socketTimeoutMS=20000,
+    )
     db = _motor_client[settings.mongodb_db_name]
 
     await init_beanie(
