@@ -20,7 +20,12 @@ class Settings(BaseSettings):
     app_debug: bool = True
     app_host: str = "0.0.0.0"
     app_port: int = 8000
-    allowed_origins: str = "http://localhost:3000,http://localhost:5173"
+    allowed_origins: str = (
+        "https://nigeriavoterwatch.vercel.app,"
+        "https://nigeriavoterwatch.onrender.com,"
+        "http://localhost:3000,"
+        "http://localhost:5173"
+    )
 
     @property
     def cors_origins(self) -> List[str]:
