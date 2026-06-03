@@ -38,8 +38,9 @@ bcrypt==4.0.1
 
 # Config & environment
 python-dotenv==1.0.1
-pydantic==2.10.3
-pydantic-settings==2.7.0
+pydantic==2.5.3
+pydantic-core==2.14.6
+pydantic-settings==2.1.0
 
 # Caching
 redis==5.2.1
