@@ -121,3 +121,146 @@ async def test_failed_downloads_do_not_consume_chain_sequence(mock_db, monkeypat
     failed = [e for e in scraper._batch if e.document_status == "download_failed"]
     assert len(failed) == 10 and all(e.chain_sequence is None for e in failed)
     assert [e.chain_sequence for e in chained] == list(range(1, 21))
+
+
+# ---------------------------------------------------------------------------
+# Batched inserts under concurrency (regression for the 2026-11-25 seq 251 gap)
+# ---------------------------------------------------------------------------
+
+class _FakeStore:
+    """Stand-in for ScrapeLogEntry.insert_many with the unique chain_sequence
+    index. The insert takes time, so other tasks keep queueing rows meanwhile."""
+
+    def __init__(self, fail_on_call: int | None = None):
+        self.rows: list = []
+        self.calls = 0
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.fail_on_call = fail_on_call
+
+    async def insert_many(self, docs, *args, **kwargs):
+        from pymongo.errors import BulkWriteError
+        docs = list(docs)  # what was sent at call time
+        self.calls += 1
+        call = self.calls
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            await asyncio.sleep(0.01)
+            if call == self.fail_on_call:
+                raise BulkWriteError({"writeErrors": [{"index": 0, "code": 11000}]})
+            stored = {r.chain_sequence for r in self.rows if r.chain_sequence is not None}
+            for d in docs:
+                if d.chain_sequence is not None and d.chain_sequence in stored:
+                    raise BulkWriteError({"writeErrors": [{"index": 0, "code": 11000,
+                                          "keyValue": {"chain_sequence": d.chain_sequence}}]})
+            self.rows.extend(docs)
+        finally:
+            self.in_flight -= 1
+
+
+async def _run_units(scraper, n, monkeypatch, store, downloads: list | None = None):
+    """Runs units through _process_all, as the real run does. Returns the
+    exception it raised, or None."""
+    rng = random.Random(99)
+
+    async def fake_download(url: str, save_to):
+        if downloads is not None:
+            downloads.append(url)
+        await asyncio.sleep(rng.choice([0, 0, 0.001, 0.002]))
+        return _DownloadResult(True, url, 200, 1, hashlib.sha256(url.encode()).hexdigest(),
+                               "application/pdf")
+
+    async def head_from_store():
+        # The chain head check reads MongoDB; here the fake store is the database
+        chained = [r for r in store.rows if r.chain_sequence is not None]
+        return max(chained, key=lambda r: r.chain_sequence) if chained else None
+
+    monkeypatch.setattr(scraper, "_download", fake_download)
+    monkeypatch.setattr(scraper, "_read_chain_head", head_from_store)
+    monkeypatch.setattr(irev.ScrapeLogEntry, "insert_many", store.insert_many)
+    try:
+        await scraper._process_all([_unit(i) for i in range(n)])
+    except Exception as exc:
+        return exc
+    return None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_flushes_store_every_row_once_in_chain_order(mock_db, monkeypatch):
+    scraper = _scraper()
+    store = _FakeStore()
+    n = 3 * irev._INSERT_BATCH + 17
+
+    error = await _run_units(scraper, n, monkeypatch, store)
+    await scraper._flush_batch()
+
+    assert error is None
+    assert store.max_in_flight == 1  # flushes never overlap
+    # Every sequence stored exactly once, in order, nothing lost
+    assert [r.chain_sequence for r in store.rows] == list(range(1, n + 1))
+    prev = _image_genesis_hash()
+    for r in store.rows:
+        assert r.prev_image_block_hash == prev
+        prev = r.image_block_hash
+    assert scraper._chain_tip() == (n, prev)
+
+
+@pytest.mark.asyncio
+async def test_failed_flush_stops_later_writes_and_reports_stored_tip(mock_db, monkeypatch):
+    scraper = _scraper()
+    store = _FakeStore(fail_on_call=2)
+    n = 3 * irev._INSERT_BATCH
+
+    error = await _run_units(scraper, n, monkeypatch, store)
+    await scraper._flush_batch()  # the run's final flush must not write either
+
+    assert error is not None
+    # Only the first batch is stored; nothing chains past the failed batch
+    seqs = [r.chain_sequence for r in store.rows]
+    assert seqs == list(range(1, irev._INSERT_BATCH + 1))
+    assert store.calls == 2
+    assert scraper._chain_tip() == (irev._INSERT_BATCH, store.rows[-1].image_block_hash)
+    assert scraper._chain_sequence > irev._INSERT_BATCH  # in-memory tip ran ahead
+
+
+@pytest.mark.asyncio
+async def test_failure_cancels_in_flight_units(mock_db, monkeypatch):
+    scraper = _scraper()
+    store = _FakeStore(fail_on_call=1)
+    downloads: list[str] = []
+    n = 5 * irev._INSERT_BATCH
+
+    error = await _run_units(scraper, n, monkeypatch, store, downloads)
+    started_at_failure = len(downloads)
+    await asyncio.sleep(0.05)  # anything left running would keep downloading
+
+    assert error is not None
+    assert len(downloads) == started_at_failure < n  # the rest were cancelled
+    others = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    assert not others  # no unit task outlives _process_all
+    assert store.rows == [] and store.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_insert_counts_as_failed_flush(mock_db, monkeypatch):
+    scraper = _scraper()
+    started = asyncio.Event()
+
+    async def hanging_insert(docs, *a, **k):
+        started.set()
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(irev.ScrapeLogEntry, "insert_many", hanging_insert)
+    scraper._batch = [object()]  # contents don't matter to the fake
+    flush = asyncio.create_task(scraper._flush_batch())
+    await started.wait()
+    flush.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await flush
+
+    # Batch may or may not be stored, so later rows must not chain onto it
+    assert scraper._flush_failed
+    scraper._batch = [object()]
+    await scraper._flush_batch()  # dropped, not sent to the hanging insert
+    assert scraper._batch == []

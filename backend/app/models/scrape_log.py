@@ -28,6 +28,9 @@ class IRevScrapeRun(Document):
     started_at: datetime = Field(default_factory=datetime.utcnow)
     completed_at: Optional[datetime] = None
     status: ScrapeRunStatus = ScrapeRunStatus.RUNNING
+    # Refreshed every 30 s while the run is alive. A RUNNING record with a
+    # heartbeat in the last 10 minutes holds the run lock (see IRevScraper).
+    heartbeat_at: Optional[datetime] = None
 
     total_polling_units_visited: int = 0
     images_downloaded: int = 0

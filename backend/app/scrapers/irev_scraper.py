@@ -36,16 +36,18 @@ import email.utils
 import hashlib
 import json
 import random
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
 import httpx
 import structlog
+from pymongo.errors import BulkWriteError
 
 from app.config import settings
 from app.models.scrape_log import IRevScrapeRun, ScrapeLogEntry, ScrapeRunStatus
@@ -67,6 +69,9 @@ _MAGIC = (
 
 _CHUNK_SIZE = 64 * 1024
 _INSERT_BATCH = 100
+# Run lock: a RUNNING run whose heartbeat is newer than this blocks new runs.
+_HEARTBEAT_INTERVAL_SECONDS = 30.0
+_LOCK_STALE_AFTER = timedelta(minutes=10)
 _BACKOFF_BASE_SECONDS = 2.0
 _BACKOFF_MAX_SECONDS = 120.0
 
@@ -106,6 +111,15 @@ class _Throttle:
             if delay > 0:
                 await asyncio.sleep(delay)
             self._next_at = time.monotonic() + self._interval
+
+
+def _as_utc(dt: datetime) -> datetime:
+    """MongoDB returns naive UTC datetimes; make them comparable with aware ones."""
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _short_hash(h: Optional[str]) -> str:
+    return f"{h[:16]}…" if h else "none"
 
 
 def _is_retryable_status(status: int) -> bool:
@@ -187,6 +201,11 @@ class _PendingUnit:
 # Scraper
 # ---------------------------------------------------------------------------
 
+class ChainHeadMovedError(RuntimeError):
+    """The image chain head in MongoDB is not the one this run last wrote:
+    another writer has extended the chain, so this run must stop."""
+
+
 class IRevScraper:
     def __init__(
         self,
@@ -222,6 +241,20 @@ class IRevScraper:
         self.skipped_hosts: set[str] = set()
 
         self._batch: list[ScrapeLogEntry] = []
+        # Serialises insert_many calls so batches reach MongoDB in chain order
+        # and two tasks can never flush the same rows (see _flush_batch).
+        self._flush_lock = asyncio.Lock()
+        # Set once a flush fails: later chained rows would link to rows that
+        # may not be in MongoDB, so nothing more is written for this run.
+        self._flush_failed = False
+        # Last chained entry actually stored — the tip the next run resumes from
+        self._stored_tip_sequence: Optional[int] = None
+        self._stored_tip_hash: Optional[str] = None
+        # Run lock
+        self._heartbeat_interval = _HEARTBEAT_INTERVAL_SECONDS
+        self._heartbeat_task: Optional[asyncio.Task] = None
+        # Set when run() refused to start: the live run that holds the lock
+        self.lock_holder: Optional[IRevScrapeRun] = None
         self._samples_reserved = 0
         self.saved_samples: list[str] = []
         self.discovery_stopped_early = False
@@ -236,8 +269,17 @@ class IRevScraper:
             logger.warning("IReV scrape skipped: no state or election ids configured")
             return None
 
+        # Run lock (a dry run writes nothing, so it neither takes nor checks it)
+        if not self.dry_run:
+            holder = await self._earliest_live_run()
+            if holder is not None:
+                self._refuse(holder)
+                return None
+
+        now = datetime.now(timezone.utc)
         self._run = IRevScrapeRun(
-            started_at=datetime.now(timezone.utc),
+            started_at=now,
+            heartbeat_at=now,
             filter_state=self.state,
             filter_election_ids=self.election_ids,
             filter_limit=self.limit,
@@ -246,13 +288,31 @@ class IRevScraper:
             await self._run.insert()
             logger.info("MongoDB insert irev_scrape_runs", run_id=str(self._run.id))
 
+            # Two runs can pass the check above at the same moment. Both
+            # records exist now, so each sees the other here and they agree
+            # on one winner: the earliest started_at (then _id).
+            holder = await self._earliest_live_run()
+            if holder is None or holder.id != self._run.id:
+                self._run.status = ScrapeRunStatus.FAILED
+                self._run.completed_at = datetime.now(timezone.utc)
+                self._run.error_message = (
+                    "Refused to run: run lock is held by run "
+                    f"{holder.id if holder else 'unknown'}, which started first"
+                )
+                await self._run.save()
+                self._refuse(holder)
+                self._run = None
+                return None
+
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
         log = logger.bind(run_id=str(self._run.id), dry_run=self.dry_run)
         log.info("IReV scrape run started", state=self.state,
                  election_ids=self.election_ids, limit=self.limit)
 
-        await self._load_chain_tip()
-
         try:
+            await self._load_chain_tip()
+
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(60.0, connect=15.0),
                 follow_redirects=False,
@@ -261,7 +321,7 @@ class IRevScraper:
             ) as http_client:
                 self._http = http_client
                 pending = await self._discover_units()
-                await asyncio.gather(*(self._process_unit(u) for u in pending))
+                await self._process_all(pending)
 
             await self._flush_batch()
             self._run.status = ScrapeRunStatus.COMPLETED
@@ -271,18 +331,32 @@ class IRevScraper:
             try:
                 await self._flush_batch()
             except Exception as flush_exc:
-                # e.g. the same duplicate chain_sequence that failed the run —
-                # don't let it mask the original error or skip marking FAILED
-                log.error("Final scrape_log flush failed; batch dropped",
-                          error=str(flush_exc)[:500], dropped=len(self._batch))
-                self._batch.clear()
+                # Don't let a flush error mask the original error or skip
+                # marking FAILED. _flush_batch already dropped the rows.
+                log.error("Final scrape_log flush failed", error=str(flush_exc)[:500])
             self._run.status = ScrapeRunStatus.FAILED
             self._run.error_message = str(exc)[:1000]
 
         finally:
+            await self._stop_heartbeat()
+            if self._run.status == ScrapeRunStatus.RUNNING:
+                # Only reached when the run is leaving on a BaseException
+                # (task cancelled, KeyboardInterrupt, SystemExit); every other
+                # error was handled above. Never leave a RUNNING record behind.
+                exc_type = sys.exc_info()[0]
+                reason = exc_type.__name__ if exc_type else "unknown"
+                self._run.status = ScrapeRunStatus.FAILED
+                self._run.error_message = (
+                    f"Run exited without finishing ({reason}); queued scrape_log rows "
+                    "were not written and those units will be scraped again"
+                )
+                log.error("IReV scrape run interrupted", reason=reason)
             self._run.completed_at = datetime.now(timezone.utc)
-            self._run.chain_tip_hash = self._prev_block_hash
-            self._run.chain_tip_sequence = self._chain_sequence
+            # Record the tip that is really in MongoDB, not the in-memory one,
+            # which can run ahead of it when a flush fails.
+            tip_seq, tip_hash = self._chain_tip()
+            self._run.chain_tip_hash = tip_hash
+            self._run.chain_tip_sequence = tip_seq
             if not self.dry_run:
                 await self._run.save()
                 logger.info("MongoDB update irev_scrape_runs", run_id=str(self._run.id),
@@ -304,11 +378,67 @@ class IRevScraper:
         return self._run
 
     # ------------------------------------------------------------------
+    # Run lock + heartbeat
+    # ------------------------------------------------------------------
+
+    async def _earliest_live_run(self) -> Optional[IRevScrapeRun]:
+        """The live run that holds the lock, or None.
+
+        Live = status RUNNING with a heartbeat in the last 10 minutes. A run
+        whose process died stops heartbeating, so its lock lapses by itself;
+        records with no heartbeat at all (older runs) never count as live.
+        When several are live, the earliest started_at (then _id) holds it.
+        """
+        cutoff = datetime.now(timezone.utc) - _LOCK_STALE_AFTER
+        live = await IRevScrapeRun.find({
+            "status": ScrapeRunStatus.RUNNING.value,
+            "heartbeat_at": {"$gte": cutoff},
+        }).to_list()
+        if not live:
+            return None
+        return min(live, key=lambda r: (_as_utc(r.started_at), str(r.id)))
+
+    def _refuse(self, holder: Optional[IRevScrapeRun]):
+        self.lock_holder = holder
+        logger.warning(
+            "IReV scrape refused: another run holds the run lock",
+            holder_run_id=str(holder.id) if holder else None,
+            holder_started_at=holder.started_at.isoformat() if holder else None,
+            holder_heartbeat_at=(holder.heartbeat_at.isoformat()
+                                 if holder and holder.heartbeat_at else None),
+        )
+
+    async def _heartbeat_loop(self):
+        """Refresh heartbeat_at so other processes see this run is alive."""
+        coll = IRevScrapeRun.get_motor_collection()
+        while True:
+            await asyncio.sleep(self._heartbeat_interval)
+            now = datetime.now(timezone.utc)
+            try:
+                await coll.update_one(
+                    {"_id": self._run.id, "status": ScrapeRunStatus.RUNNING.value},
+                    {"$set": {"heartbeat_at": now}},
+                )
+                self._run.heartbeat_at = now
+            except Exception as exc:
+                # Keep scraping; the chain head check still guards the chain
+                # if the lock lapses and another run starts.
+                logger.warning("Heartbeat write failed", run_id=str(self._run.id),
+                               error=str(exc)[:300])
+
+    async def _stop_heartbeat(self):
+        task, self._heartbeat_task = self._heartbeat_task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    # ------------------------------------------------------------------
     # Resume chain from last committed tip
     # ------------------------------------------------------------------
 
-    async def _load_chain_tip(self):
-        last = (
+    async def _read_chain_head(self) -> Optional[ScrapeLogEntry]:
+        """The highest-sequence chained row currently in MongoDB."""
+        return (
             # $type matches the partial unique index's filter, so the tip
             # lookup is an index read rather than a collection scan + sort
             await ScrapeLogEntry.find({"chain_sequence": {"$type": "number"}})
@@ -316,9 +446,14 @@ class IRevScraper:
             .limit(1)
             .first_or_none()
         )
+
+    async def _load_chain_tip(self):
+        last = await self._read_chain_head()
         if last and last.image_block_hash:
             self._chain_sequence = last.chain_sequence
             self._prev_block_hash = last.image_block_hash
+            self._stored_tip_sequence = last.chain_sequence
+            self._stored_tip_hash = last.image_block_hash
             logger.info("Resumed image chain", sequence=self._chain_sequence,
                         prev=self._prev_block_hash[:16] + "…")
         else:
@@ -457,6 +592,29 @@ class IRevScraper:
     # ------------------------------------------------------------------
     # Per polling unit
     # ------------------------------------------------------------------
+
+    async def _process_all(self, pending: list[_PendingUnit]):
+        """Process every unit concurrently; on the first failure, cancel the rest.
+
+        Plain asyncio.gather re-raises the first error but leaves the other
+        tasks running, so they kept downloading (and queueing rows) after the
+        run had already been marked FAILED. Here the remaining tasks are
+        cancelled and awaited before the error propagates, so nothing from
+        this run is still running when the final flush and run save happen.
+        A task that is waiting for its download or for the flush lock simply
+        stops; its unit gets no scrape_log row and is scraped again next run.
+        """
+        tasks = [asyncio.create_task(self._process_unit(u)) for u in pending]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            # Also covers this run itself being cancelled (e.g. scheduler shutdown)
+            cancelled = sum(t.cancel() for t in tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if cancelled:
+                logger.warning("Cancelled in-flight polling units after failure",
+                               cancelled=cancelled, total=len(tasks))
+            raise
 
     async def _process_unit(self, unit: _PendingUnit):
         t0 = time.monotonic()
@@ -722,11 +880,85 @@ class IRevScraper:
             await self._flush_batch()
 
     async def _flush_batch(self):
-        if not self._batch:
-            return
-        await ScrapeLogEntry.insert_many(self._batch)
-        logger.info("MongoDB insert_many scrape_log", documents=len(self._batch))
-        self._batch.clear()
+        """Write the queued rows to MongoDB.
+
+        Units are processed concurrently and all append to self._batch, so the
+        batch is swapped out *before* the await: rows queued while insert_many
+        is in flight go into the next batch instead of being re-sent (duplicate
+        chain_sequence) or wiped by a clear() after the insert. The lock keeps
+        batches in chain order. On 2026-11-25 the old code sent seq 151-250
+        twice and lost seq 251, breaking the image chain.
+
+        After a failed insert, every later flush in the run drops its rows:
+        they would chain onto rows that may never have been stored. The units
+        have no scrape_log row, so the next run scrapes them again.
+
+        Before each insert the chain head is re-read from MongoDB. If it is not
+        the row this run last stored (or the tip it resumed from), another
+        writer has extended or changed the chain: the run aborts with
+        ChainHeadMovedError and writes nothing more.
+
+        The insert is ordered: on a duplicate chain_sequence MongoDB stops at
+        that row, so no later row in the batch is stored past the conflict.
+        """
+        async with self._flush_lock:
+            if not self._batch:
+                return
+            batch, self._batch = self._batch, []
+            if self._flush_failed:
+                logger.error("scrape_log rows dropped after earlier flush failure",
+                             dropped=len(batch))
+                return
+
+            head = await self._read_chain_head()
+            found = (head.chain_sequence, head.image_block_hash) if head else (None, None)
+            expected = (self._stored_tip_sequence, self._stored_tip_hash)
+            if found != expected:
+                self._flush_failed = True
+                message = (
+                    "Image chain head moved during this run: expected seq "
+                    f"{expected[0]} ({_short_hash(expected[1])}), database has seq "
+                    f"{found[0]} ({_short_hash(found[1])})"
+                    + (f" written by run {head.run_id}" if head else "")
+                    + ". Another writer changed the chain; aborting without writing "
+                    f"{len(batch)} queued scrape_log rows."
+                )
+                logger.error("Image chain head moved; aborting run",
+                             expected_sequence=expected[0], found_sequence=found[0],
+                             found_run_id=str(head.run_id) if head else None,
+                             dropped=len(batch))
+                raise ChainHeadMovedError(message)
+
+            try:
+                await ScrapeLogEntry.insert_many(batch, ordered=True)
+            except BaseException as exc:
+                # BaseException: a task cancelled mid-insert leaves the batch
+                # in an unknown state (stored or not), so it counts as failed.
+                self._flush_failed = True
+                # Ordered insert: exactly the rows before the failing one landed
+                stored = 0
+                if isinstance(exc, BulkWriteError):
+                    stored = exc.details.get("nInserted", 0)
+                    self._note_stored(batch[:stored])
+                logger.error("MongoDB insert_many scrape_log failed",
+                             documents=len(batch), stored=stored)
+                raise
+            logger.info("MongoDB insert_many scrape_log", documents=len(batch))
+            self._note_stored(batch)
+
+    def _note_stored(self, rows: list[ScrapeLogEntry]):
+        """Advance the stored chain tip past rows MongoDB has accepted."""
+        chained = [e for e in rows if e.chain_sequence is not None]
+        if chained:
+            last = max(chained, key=lambda e: e.chain_sequence)
+            self._stored_tip_sequence = last.chain_sequence
+            self._stored_tip_hash = last.image_block_hash
+
+    def _chain_tip(self) -> tuple[Optional[int], Optional[str]]:
+        """Chain tip to report: the stored one, or the in-memory one in a dry run."""
+        if self.dry_run:
+            return self._chain_sequence, self._prev_block_hash
+        return self._stored_tip_sequence, self._stored_tip_hash
 
     # ------------------------------------------------------------------
     # Public JSON snapshot export
@@ -748,11 +980,12 @@ class IRevScraper:
         ]
         rows = await ScrapeLogEntry.get_motor_collection().aggregate(pipeline).to_list(None)
 
+        tip_seq, tip_hash = self._chain_tip()
         snapshot = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "scrape_id": str(self._run.id),
-            "chain_tip_hash": self._prev_block_hash,
-            "chain_tip_sequence": self._chain_sequence,
+            "chain_tip_hash": tip_hash,
+            "chain_tip_sequence": tip_seq,
             "summary": {
                 "total_polling_units": self._run.total_polling_units_visited,
                 "images_downloaded": self._run.images_downloaded,
@@ -844,6 +1077,12 @@ async def _main(argv: Optional[list[str]] = None) -> int:
         )
         t0 = time.monotonic()
         run = await scraper.run()
+        if run is None:
+            holder = scraper.lock_holder
+            if holder is not None:
+                print(f"Refused: IReV run {holder.id} is still running "
+                      f"(started {holder.started_at}, last heartbeat {holder.heartbeat_at}).")
+            return 2
         _print_summary(scraper, run, time.monotonic() - t0)
         return 0 if run.status == ScrapeRunStatus.COMPLETED else 1
     finally:
