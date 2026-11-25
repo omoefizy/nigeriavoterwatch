@@ -36,6 +36,7 @@ import email.utils
 import hashlib
 import json
 import random
+import signal
 import sys
 import tempfile
 import time
@@ -72,6 +73,10 @@ _INSERT_BATCH = 100
 # Run lock: a RUNNING run whose heartbeat is newer than this blocks new runs.
 _HEARTBEAT_INTERVAL_SECONDS = 30.0
 _LOCK_STALE_AFTER = timedelta(minutes=10)
+# After SIGTERM/SIGINT, how long downloads already in flight may run before
+# they are cancelled. Render sends SIGKILL 30 s after SIGTERM, so this leaves
+# time for the final flush and run save.
+_STOP_GRACE_SECONDS = 20.0
 _BACKOFF_BASE_SECONDS = 2.0
 _BACKOFF_MAX_SECONDS = 120.0
 
@@ -255,6 +260,14 @@ class IRevScraper:
         self._heartbeat_task: Optional[asyncio.Task] = None
         # Set when run() refused to start: the live run that holds the lock
         self.lock_holder: Optional[IRevScrapeRun] = None
+        # Graceful stop (SIGTERM/SIGINT): see request_stop()
+        self._stop_event = asyncio.Event()
+        self.stop_reason: Optional[str] = None
+        self._stop_grace_seconds = _STOP_GRACE_SECONDS
+        # Counts of scrape_log rows MongoDB has accepted, written to the run
+        # record after every flush so a run that dies still shows real progress
+        self._stored_counts = {"total_polling_units_visited": 0, "images_downloaded": 0,
+                               "missing_url_count": 0, "broken_url_count": 0}
         self._samples_reserved = 0
         self.saved_samples: list[str] = []
         self.discovery_stopped_early = False
@@ -271,6 +284,7 @@ class IRevScraper:
 
         # Run lock (a dry run writes nothing, so it neither takes nor checks it)
         if not self.dry_run:
+            await self.fail_stale_runs()
             holder = await self._earliest_live_run()
             if holder is not None:
                 self._refuse(holder)
@@ -324,7 +338,17 @@ class IRevScraper:
                 await self._process_all(pending)
 
             await self._flush_batch()
-            self._run.status = ScrapeRunStatus.COMPLETED
+            if self.stop_requested:
+                self._run.status = ScrapeRunStatus.INTERRUPTED
+                self._run.error_message = (
+                    f"Interrupted by {self.stop_reason}: stopped taking new units after "
+                    f"{self._run.total_polling_units_visited} processed; queued rows flushed. "
+                    "Unprocessed units will be scraped by the next run."
+                )
+                log.warning("IReV scrape run interrupted cleanly", reason=self.stop_reason,
+                            processed=self._run.total_polling_units_visited)
+            else:
+                self._run.status = ScrapeRunStatus.COMPLETED
 
         except Exception as exc:
             log.error("IReV scrape run failed", error=str(exc))
@@ -378,8 +402,84 @@ class IRevScraper:
         return self._run
 
     # ------------------------------------------------------------------
+    # Graceful stop (SIGTERM / SIGINT)
+    # ------------------------------------------------------------------
+
+    def request_stop(self, reason: str = "stop request"):
+        """Ask the run to stop: take no new units, let in-flight downloads finish
+        (up to the grace period), flush, save the run as INTERRUPTED.
+
+        Safe to call from a signal handler registered with loop.add_signal_handler
+        (it only sets an event). Repeated calls are ignored.
+        """
+        if self._stop_event.is_set():
+            return
+        self.stop_reason = reason
+        self._stop_event.set()
+        logger.warning("IReV scrape stop requested", reason=reason,
+                       run_id=str(self._run.id) if self._run else None)
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_event.is_set()
+
+    # ------------------------------------------------------------------
     # Run lock + heartbeat
     # ------------------------------------------------------------------
+
+    @staticmethod
+    async def fail_stale_runs() -> list[IRevScrapeRun]:
+        """Mark FAILED every RUNNING run whose heartbeat is older than 10 minutes.
+
+        Such a run's process is gone (a live run heartbeats every 30 s), but its
+        record would otherwise say "running" forever. Runs from before heartbeats
+        existed (heartbeat_at null) count as stale once started 10+ minutes ago.
+        Only the run record changes; its scrape_log rows are left as they are.
+        Each run marked writes an AuditLog entry.
+        """
+        from app.models.audit import AuditAction, AuditLog
+
+        now = datetime.now(timezone.utc)
+        cutoff = now - _LOCK_STALE_AFTER
+        stale_filter = {
+            "status": ScrapeRunStatus.RUNNING.value,
+            "$or": [
+                {"heartbeat_at": {"$lt": cutoff}},
+                {"heartbeat_at": None, "started_at": {"$lt": cutoff}},
+            ],
+        }
+        coll = IRevScrapeRun.get_motor_collection()
+        marked: list[IRevScrapeRun] = []
+        for run in await IRevScrapeRun.find(stale_filter).to_list():
+            beat = run.heartbeat_at.isoformat() if run.heartbeat_at else "never"
+            message = (
+                f"Marked failed at scraper startup: still RUNNING but last heartbeat "
+                f"({beat}) is older than {int(_LOCK_STALE_AFTER.total_seconds() // 60)} "
+                "minutes, so its process is gone."
+            )
+            # Re-check the condition in the update so a run that heartbeats
+            # between the find and here is left alone.
+            res = await coll.update_one(
+                {"_id": run.id, **stale_filter},
+                {"$set": {"status": ScrapeRunStatus.FAILED.value, "completed_at": now,
+                          "error_message": message}},
+            )
+            if res.modified_count != 1:
+                continue
+            await AuditLog(
+                action=AuditAction.SCRAPE_FAILED,
+                actor_type="system",
+                actor_id="irev_scraper",
+                entity_type="irev_scrape_run",
+                entity_id=str(run.id),
+                details={"reason": "stale run marked failed at startup",
+                         "last_heartbeat_at": beat,
+                         "started_at": run.started_at.isoformat()},
+            ).insert()
+            logger.warning("Stale IReV run marked failed", run_id=str(run.id),
+                           last_heartbeat_at=beat)
+            marked.append(run)
+        return marked
 
     async def _earliest_live_run(self) -> Optional[IRevScrapeRun]:
         """The live run that holds the lock, or None.
@@ -553,6 +653,8 @@ class IRevScraper:
             for lga_entry in lgas:
                 lga = lga_entry.get("lga") or {}
                 for ward in lga_entry.get("wards") or []:
+                    if self.stop_requested:
+                        return pending  # _process_all will take none of them
                     if self._limit_reached(pending):
                         self.discovery_stopped_early = True
                         return pending
@@ -605,8 +707,16 @@ class IRevScraper:
         stops; its unit gets no scrape_log row and is scraped again next run.
         """
         tasks = [asyncio.create_task(self._process_unit(u)) for u in pending]
+        gathered = asyncio.gather(*tasks)
+        stop_wait = asyncio.ensure_future(self._stop_event.wait())
         try:
-            await asyncio.gather(*tasks)
+            await asyncio.wait({gathered, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if not gathered.done():
+                # Stop requested. Units not yet started skip themselves (see
+                # _process_unit); downloads in flight get the grace period.
+                if await self._wind_down(tasks, gathered):
+                    return
+            await gathered  # re-raises the first unit error, if any
         except BaseException:
             # Also covers this run itself being cancelled (e.g. scheduler shutdown)
             cancelled = sum(t.cancel() for t in tasks)
@@ -615,8 +725,41 @@ class IRevScraper:
                 logger.warning("Cancelled in-flight polling units after failure",
                                cancelled=cancelled, total=len(tasks))
             raise
+        finally:
+            stop_wait.cancel()
+
+    async def _wind_down(self, tasks: list[asyncio.Task], gathered: asyncio.Future) -> bool:
+        """After a stop request: wait up to the grace period for in-flight units,
+        then cancel the stragglers. Returns True if any were cancelled.
+
+        Cancelling happens while holding the flush lock, so no insert_many is in
+        progress when a task is cancelled. A unit's row is appended to the batch
+        in the same synchronous step as its chain extension, so a cancelled task
+        either has its row queued (and the final flush writes it) or has no row
+        and no chain sequence at all.
+        """
+        try:
+            await asyncio.wait_for(asyncio.shield(gathered), self._stop_grace_seconds)
+            return False
+        except asyncio.TimeoutError:
+            pass
+        async with self._flush_lock:
+            cancelled = sum(t.cancel() for t in tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+        logger.warning("Cancelled in-flight polling units after stop grace period",
+                       cancelled=cancelled, grace_s=self._stop_grace_seconds)
+        # `gathered` now holds the CancelledError from those tasks, which is not
+        # a run failure; mark it retrieved and surface only real unit errors.
+        if gathered.done() and not gathered.cancelled():
+            gathered.exception()
+        for t in tasks:
+            if not t.cancelled() and t.exception() is not None:
+                raise t.exception()
+        return True
 
     async def _process_unit(self, unit: _PendingUnit):
+        if self.stop_requested:
+            return  # no new units after a stop request; next run picks it up
         t0 = time.monotonic()
         candidates = [(f, unit.document[f]) for f in _URL_FIELDS if unit.document.get(f)]
         result: Optional[_DownloadResult] = None
@@ -625,6 +768,8 @@ class IRevScraper:
 
         if candidates:
             async with self._download_sem:
+                if self.stop_requested:
+                    return  # stop arrived while this unit waited for a download slot
                 save_to = self._reserve_sample_path(unit)
                 for field, url in candidates:
                     result = await self._download(url, save_to)
@@ -945,9 +1090,43 @@ class IRevScraper:
                 raise
             logger.info("MongoDB insert_many scrape_log", documents=len(batch))
             self._note_stored(batch)
+            await self._write_progress()
+
+    async def _write_progress(self):
+        """Write the run's counters and chain tip after a flush.
+
+        Counters come from rows MongoDB has accepted (not the in-memory ones,
+        which include rows still queued), so a run that dies mid-way shows its
+        real progress. Only touches a RUNNING record, so it can never undo a
+        final status. A failed write is logged and the run carries on: the
+        final save at the end of run() writes the same fields again.
+        """
+        if self.dry_run or self._run is None or self._run.id is None:
+            return
+        tip_seq, tip_hash = self._chain_tip()
+        try:
+            await IRevScrapeRun.get_motor_collection().update_one(
+                {"_id": self._run.id, "status": ScrapeRunStatus.RUNNING.value},
+                {"$set": {**self._stored_counts,
+                          "units_found": self._run.units_found,
+                          "units_skipped_already_done": self._run.units_skipped_already_done,
+                          "chain_tip_sequence": tip_seq,
+                          "chain_tip_hash": tip_hash}},
+            )
+        except Exception as exc:
+            logger.warning("Run progress write failed", run_id=str(self._run.id),
+                           error=str(exc)[:300])
 
     def _note_stored(self, rows: list[ScrapeLogEntry]):
-        """Advance the stored chain tip past rows MongoDB has accepted."""
+        """Advance the stored chain tip and counts past rows MongoDB has accepted."""
+        for e in rows:
+            self._stored_counts["total_polling_units_visited"] += 1
+            if e.document_status == DocStatus.DOWNLOADED:
+                self._stored_counts["images_downloaded"] += 1
+            elif e.document_status == DocStatus.NO_DOCUMENT:
+                self._stored_counts["missing_url_count"] += 1
+            elif e.document_status == DocStatus.DOWNLOAD_FAILED:
+                self._stored_counts["broken_url_count"] += 1
         chained = [e for e in rows if e.chain_sequence is not None]
         if chained:
             last = max(chained, key=lambda e: e.chain_sequence)
@@ -1037,6 +1216,40 @@ def _parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return args
 
 
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
+
+def install_stop_signal_handlers(scraper: IRevScraper, received: Optional[list[int]] = None):
+    """Route SIGTERM and SIGINT to scraper.request_stop() on the running loop.
+
+    The run then stops taking units, flushes, and saves itself as INTERRUPTED
+    instead of dying with a RUNNING record. Signal numbers received are
+    appended to `received`. Returns a function that removes the handlers
+    (SIGINT goes back to raising KeyboardInterrupt).
+    """
+    loop = asyncio.get_running_loop()
+
+    def on_signal(signum: int):
+        if received is not None:
+            received.append(signum)
+        scraper.request_stop(signal.Signals(signum).name)
+
+    installed = []
+    for sig in _STOP_SIGNALS:
+        try:
+            loop.add_signal_handler(sig, on_signal, sig)
+            installed.append(sig)
+        except (NotImplementedError, RuntimeError):
+            # Windows, or not in the main thread: keep the default behaviour
+            logger.warning("Could not install signal handler", signal=sig.name)
+
+    def restore():
+        for sig in installed:
+            loop.remove_signal_handler(sig)
+
+    return restore
+
+
 def _print_summary(scraper: IRevScraper, run: IRevScrapeRun, seconds: float):
     found = f"{run.units_found}" + (" (discovery stopped at --limit)"
                                     if scraper.discovery_stopped_early else "")
@@ -1076,7 +1289,12 @@ async def _main(argv: Optional[list[str]] = None) -> int:
             dry_run=args.dry_run,
         )
         t0 = time.monotonic()
-        run = await scraper.run()
+        received: list[int] = []
+        restore = install_stop_signal_handlers(scraper, received)
+        try:
+            run = await scraper.run()
+        finally:
+            restore()
         if run is None:
             holder = scraper.lock_holder
             if holder is not None:
@@ -1084,6 +1302,8 @@ async def _main(argv: Optional[list[str]] = None) -> int:
                       f"(started {holder.started_at}, last heartbeat {holder.heartbeat_at}).")
             return 2
         _print_summary(scraper, run, time.monotonic() - t0)
+        if run.status == ScrapeRunStatus.INTERRUPTED and received:
+            return 128 + received[0]  # shell convention: 130 for SIGINT, 143 for SIGTERM
         return 0 if run.status == ScrapeRunStatus.COMPLETED else 1
     finally:
         await close_db()

@@ -22,6 +22,8 @@ class ScrapeRunStatus(str, enum.Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     PARTIAL = "partial"
+    # Stopped by SIGTERM/SIGINT: took no new units, flushed what it had, exited cleanly
+    INTERRUPTED = "interrupted"
 
 
 class IRevScrapeRun(Document):
