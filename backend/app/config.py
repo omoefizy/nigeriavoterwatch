@@ -6,6 +6,10 @@ from typing import List
 # Walk up from backend/app/ → backend/ → project root → .env
 _ENV_FILE = Path(__file__).parent.parent.parent / ".env"
 
+# Any Vercel deployment (production + preview URLs). Shared by CORS and the
+# WebSocket origin check. Matched with re.fullmatch, as Starlette does.
+CORS_ORIGIN_REGEX = r"https://.*\.vercel\.app"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
