@@ -2,6 +2,8 @@
 Google Cloud Vision OCR processor — higher accuracy fallback for poor-quality images.
 Only used when GOOGLE_APPLICATION_CREDENTIALS is configured.
 """
+import os
+
 import structlog
 from app.config import settings
 
@@ -47,4 +49,7 @@ def extract_text(image_bytes: bytes) -> dict:
 
 
 def is_available() -> bool:
-    return bool(settings.google_application_credentials)
+    # Require a real file: a placeholder value in .env would otherwise make every
+    # call try Vision, fail, and only then fall back to Tesseract.
+    path = settings.google_application_credentials
+    return bool(path) and os.path.isfile(path)
