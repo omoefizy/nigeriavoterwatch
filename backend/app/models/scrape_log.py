@@ -95,7 +95,7 @@ class ScrapeLogEntry(Document):
     missing_reason: Optional[str] = None
 
     # Image hash chain — None until an image is successfully downloaded
-    chain_sequence: Optional[int] = None    # indexed via Settings.indexes
+    chain_sequence: Optional[int] = None    # unique (partial) index via Settings.indexes
     prev_image_block_hash: Optional[str] = None
     image_block_hash: Optional[str] = None
 
@@ -115,6 +115,15 @@ class ScrapeLogEntry(Document):
             IndexModel([("pu_code", ASCENDING)]),
             IndexModel([("election_id", ASCENDING), ("pu_code", ASCENDING)]),
             IndexModel([("scraped_at", ASCENDING)]),
-            IndexModel([("chain_sequence", ASCENDING)]),
+            # Unique among chained entries only: units with no image keep
+            # chain_sequence = null, and there are many of those. A second
+            # writer that forks the chain (same sequence) gets a duplicate-key
+            # error instead of a silent fork.
+            IndexModel(
+                [("chain_sequence", ASCENDING)],
+                name="chain_sequence_unique",
+                unique=True,
+                partialFilterExpression={"chain_sequence": {"$type": "number"}},
+            ),
             IndexModel([("is_missing_url", ASCENDING), ("is_broken_url", ASCENDING)]),
         ]

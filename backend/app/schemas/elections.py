@@ -48,6 +48,7 @@ class ElectionCreate(BaseModel):
     election_type: ElectionType
     election_date: datetime
     scope_state_id: Optional[str] = None
+    irev_election_id: Optional[str] = None  # IReV portal election _id (enables C6)
 
     @field_validator("election_date")
     @classmethod
@@ -62,6 +63,7 @@ class ElectionRead(BaseModel):
     status: ElectionStatus
     election_date: datetime
     scope_state_id: Optional[str] = None
+    irev_election_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

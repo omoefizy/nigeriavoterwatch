@@ -15,7 +15,7 @@ scheduler = AsyncIOScheduler(timezone="Africa/Lagos")
 
 def setup_scheduler():
     from app.tasks.scraping_tasks import scrape_inec_results
-    from app.tasks.integrity_tasks import verify_hash_chain
+    from app.tasks.integrity_tasks import verify_all_chains
     from app.tasks.irev_tasks import scrape_irev_results
 
     scheduler.add_job(
@@ -39,10 +39,10 @@ def setup_scheduler():
     )
 
     scheduler.add_job(
-        verify_hash_chain,
+        verify_all_chains,
         trigger=IntervalTrigger(minutes=settings.chain_verification_interval_minutes),
         id="chain_verifier",
-        name="Hash Chain Integrity Verifier",
+        name="Hash Chain Integrity Verifier (results + IReV images)",
         replace_existing=True,
         max_instances=1,
     )

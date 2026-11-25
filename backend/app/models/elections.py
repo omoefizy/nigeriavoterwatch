@@ -89,6 +89,8 @@ class Election(Document):
     status: ElectionStatus = ElectionStatus.SCHEDULED
     election_date: datetime
     scope_state_id: Optional[PydanticObjectId] = None
+    # IReV portal's own election _id — links ScrapeLogEntry.election_id to this election
+    irev_election_id: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 

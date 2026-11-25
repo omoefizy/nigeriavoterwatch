@@ -78,13 +78,9 @@ class DocStatus:
 # Image chain helpers (independent namespace from the results chain)
 # ---------------------------------------------------------------------------
 
-def _image_genesis_hash() -> str:
-    seed = f"{settings.genesis_block_seed}:irev-images"
-    return hashlib.sha256(seed.encode()).hexdigest()
-
-
-def _compute_image_block_hash(image_hash: str, prev_block_hash: str) -> str:
-    return hashlib.sha256(f"{image_hash}{prev_block_hash}".encode()).hexdigest()
+# Shared with the verifier (app/utils/image_chain.py) so both always agree
+from app.utils.image_chain import compute_image_block_hash as _compute_image_block_hash  # noqa: E402
+from app.utils.image_chain import image_genesis_hash as _image_genesis_hash  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +250,14 @@ class IRevScraper:
 
         except Exception as exc:
             log.error("IReV scrape run failed", error=str(exc))
-            await self._flush_batch()
+            try:
+                await self._flush_batch()
+            except Exception as flush_exc:
+                # e.g. the same duplicate chain_sequence that failed the run —
+                # don't let it mask the original error or skip marking FAILED
+                log.error("Final scrape_log flush failed; batch dropped",
+                          error=str(flush_exc)[:500], dropped=len(self._batch))
+                self._batch.clear()
             self._run.status = ScrapeRunStatus.FAILED
             self._run.error_message = str(exc)[:1000]
 
@@ -288,7 +291,9 @@ class IRevScraper:
 
     async def _load_chain_tip(self):
         last = (
-            await ScrapeLogEntry.find(ScrapeLogEntry.chain_sequence != None)  # noqa: E711
+            # $type matches the partial unique index's filter, so the tip
+            # lookup is an index read rather than a collection scan + sort
+            await ScrapeLogEntry.find({"chain_sequence": {"$type": "number"}})
             .sort("-chain_sequence")
             .limit(1)
             .first_or_none()
