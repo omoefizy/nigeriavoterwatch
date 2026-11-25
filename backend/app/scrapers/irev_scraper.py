@@ -11,7 +11,8 @@ Traversal:
     /elections/{id}/pus?ward={id}    → polling units, each with a `document`
 
 For each polling unit it:
-  1. Tries the document URLs in order: backup_url, url, document_url
+  1. Tries the document URLs in order: document_url, url, backup_url
+     (a host that fails DNS/connection 3 times in a row is skipped for the rest of the run)
   2. Streams the file and SHA-256 hashes it chunk by chunk (never held in memory)
   3. Accepts the file only if its magic bytes are PDF / JPEG / PNG — redirects are
      never followed, so a lapsed/parked domain cannot be hashed as an EC8A
@@ -41,6 +42,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
@@ -51,7 +53,10 @@ from app.models.scrape_log import IRevScrapeRun, ScrapeLogEntry, ScrapeRunStatus
 logger = structlog.get_logger()
 
 # Document URL fields, in the order they are tried
-_URL_FIELDS = ("backup_url", "url", "document_url")
+_URL_FIELDS = ("document_url", "url", "backup_url")
+
+# Consecutive DNS/connection failures after which a host is skipped for the run
+_HOST_FAILURE_LIMIT = 3
 
 # Accepted file signatures → detected content type / extension
 _MAGIC = (
@@ -115,6 +120,15 @@ def _is_retryable_exc(exc: httpx.TransportError) -> bool:
                                   "getaddrinfo", "no address associated")):
             return False
     return True
+
+
+def _is_connection_failure(exc: httpx.TransportError) -> bool:
+    """DNS failures and refused/unreachable/timed-out connects."""
+    return isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+
+
+def _host_of(url: str) -> str:
+    return (urlsplit(url).hostname or "").lower()
 
 
 def _retry_after_seconds(value: Optional[str]) -> Optional[float]:
@@ -202,6 +216,10 @@ class IRevScraper:
         # Image chain state — carried across the entire run
         self._chain_sequence: int = 0
         self._prev_block_hash: str = _image_genesis_hash()
+
+        # Per-host DNS/connection failure memory — lives for this run only
+        self._host_failures: dict[str, int] = {}
+        self.skipped_hosts: set[str] = set()
 
         self._batch: list[ScrapeLogEntry] = []
         self._samples_reserved = 0
@@ -498,15 +516,41 @@ class IRevScraper:
         name = (unit.pu_code or "unknown").replace("/", "_")
         return self.save_dir / f"{unit.election_id}_{name}"
 
+    def _host_skipped(self, url: str) -> Optional[_DownloadResult]:
+        host = _host_of(url)
+        if host in self.skipped_hosts:
+            logger.info("HTTP GET document skipped", url=url, host=host,
+                        note="host skipped for rest of run")
+            return _DownloadResult(False, url, None,
+                                   reason=f"host {host} skipped after {_HOST_FAILURE_LIMIT} "
+                                          f"consecutive connection failures")
+        return None
+
+    def _record_host_failure(self, url: str, err: str):
+        host = _host_of(url)
+        count = self._host_failures.get(host, 0) + 1
+        self._host_failures[host] = count
+        if count >= _HOST_FAILURE_LIMIT and host not in self.skipped_hosts:
+            self.skipped_hosts.add(host)
+            logger.warning("Host skipped for rest of run", host=host,
+                           consecutive_failures=count, last_error=err[:300])
+
+    def _record_host_success(self, url: str):
+        self._host_failures.pop(_host_of(url), None)
+
     async def _download(self, url: str, save_to: Optional[Path]) -> _DownloadResult:
         retries = settings.irev_max_retries
         last_status: Optional[int] = None
         for attempt in range(retries + 1):
+            skipped = self._host_skipped(url)
+            if skipped:
+                return skipped
             await self._throttle.wait()
             t0 = time.monotonic()
             retry_after: Optional[str] = None
             try:
                 async with self._http.stream("GET", url) as resp:
+                    self._record_host_success(url)  # host answered, whatever the status
                     last_status = resp.status_code
                     server_ctype = resp.headers.get("content-type")
                     if _is_retryable_status(resp.status_code):
@@ -529,6 +573,8 @@ class IRevScraper:
                 err = f"{type(exc).__name__}: {exc}"
                 logger.warning("HTTP GET document", url=url, status=None, error=err)
                 if attempt >= retries or not _is_retryable_exc(exc):
+                    if _is_connection_failure(exc):
+                        self._record_host_failure(url, err)
                     return _DownloadResult(False, url, None, reason=err[:300])
                 await self._backoff(attempt, None, url)
                 continue
