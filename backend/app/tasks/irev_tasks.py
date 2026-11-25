@@ -12,9 +12,13 @@ async def scrape_irev_results():
     """Entry point called by APScheduler (max_instances=1)."""
     logger.info("IReV scrape cycle starting")
     try:
+        from app.config import settings
         from app.scrapers.irev_scraper import IRevScraper
-        scraper = IRevScraper()
-        await scraper.run()
+        election_ids = [
+            e.strip() for e in settings.irev_scheduled_election_ids.split(",") if e.strip()
+        ]
+        scraper = IRevScraper(election_ids=election_ids)
+        await scraper.run()  # no-op (logs a warning) when no election ids are configured
         logger.info("IReV scrape cycle committed")
 
         if scraper._run is not None:

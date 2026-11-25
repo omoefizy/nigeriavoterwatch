@@ -52,7 +52,13 @@ class Settings(BaseSettings):
     # IReV scraper
     irev_base_url: str = "https://inecelectionresults.ng"
     irev_scraper_interval_seconds: int = 300  # 5 minutes
-    irev_scraper_concurrency: int = 2
+    irev_scraper_concurrency: int = 2  # max concurrent document downloads
+    irev_api_base_url: str = "https://dolphin-app-sleqh.ondigitalocean.app/api/v1"
+    irev_request_delay_seconds: float = 1.0  # min gap between any two requests
+    irev_max_retries: int = 4  # on 429 / 5xx / transient network errors
+    # Comma-separated IReV election _ids the scheduled job scrapes.
+    # Empty = scheduled job does nothing (the CLI takes its own arguments).
+    irev_scheduled_election_ids: str = ""
 
     # Storage paths
     upload_dir: str = "./uploads"

@@ -40,6 +40,13 @@ class IRevScrapeRun(Document):
     snapshot_written_at: Optional[datetime] = None
     error_message: Optional[str] = None
 
+    # Run scope (REST API scraper) — all optional so older documents still load
+    filter_state: Optional[str] = None
+    filter_election_ids: list[str] = Field(default_factory=list)
+    filter_limit: Optional[int] = None
+    units_found: int = 0
+    units_skipped_already_done: int = 0
+
     class Settings:
         name = "irev_scrape_runs"
         indexes = [
@@ -54,6 +61,10 @@ class ScrapeLogEntry(Document):
     Never updated or deleted after insert.
     """
     run_id: PydanticObjectId
+
+    # IReV election this entry belongs to (IReV's own election _id)
+    election_id: Optional[str] = None
+    election_name: Optional[str] = None
 
     # Geographic hierarchy (mirrors INEC PU code: STATE/LGA/WARD/SEQ)
     state_code: str
@@ -74,6 +85,14 @@ class ScrapeLogEntry(Document):
     image_hash_sha256: Optional[str] = None
     image_size_bytes: Optional[int] = None
     image_stored_path: Optional[str] = None
+    # Which document field produced the file: "backup_url" | "url" | "document_url"
+    source_url_field: Optional[str] = None
+    # Detected from the file's magic bytes, not the server header
+    content_type: Optional[str] = None
+    # "downloaded" | "no_document" | "download_failed"
+    document_status: Optional[str] = None
+    # Why a unit has no file (no document uploaded, or every URL failed)
+    missing_reason: Optional[str] = None
 
     # Image hash chain — None until an image is successfully downloaded
     chain_sequence: Optional[int] = None    # indexed via Settings.indexes
@@ -94,6 +113,7 @@ class ScrapeLogEntry(Document):
         indexes = [
             IndexModel([("run_id", ASCENDING)]),
             IndexModel([("pu_code", ASCENDING)]),
+            IndexModel([("election_id", ASCENDING), ("pu_code", ASCENDING)]),
             IndexModel([("scraped_at", ASCENDING)]),
             IndexModel([("chain_sequence", ASCENDING)]),
             IndexModel([("is_missing_url", ASCENDING), ("is_broken_url", ASCENDING)]),
