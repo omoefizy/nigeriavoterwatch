@@ -37,6 +37,7 @@ def _election_read(e: Election) -> ElectionRead:
         status=e.status,
         election_date=e.election_date,
         scope_state_id=str(e.scope_state_id) if e.scope_state_id else None,
+        irev_election_id=e.irev_election_id,
         created_at=e.created_at,
         updated_at=e.updated_at,
     )
@@ -83,6 +84,7 @@ async def create_election(body: ElectionCreate, _=Depends(require_admin)):
         election_type=body.election_type,
         election_date=body.election_date,
         scope_state_id=scope_oid,
+        irev_election_id=body.irev_election_id,
     )
     await election.insert()
 

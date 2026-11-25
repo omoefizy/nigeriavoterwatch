@@ -30,7 +30,7 @@ async def upload_by_state():
         }},
         {"$sort": {"_id": 1}},
     ]
-    rows = await ScrapeLogEntry.get_pymongo_collection().aggregate(pipeline).to_list(None)
+    rows = await ScrapeLogEntry.get_motor_collection().aggregate(pipeline).to_list(None)
     return [
         {
             "state_name": r["_id"] or "Unknown",
@@ -74,7 +74,7 @@ async def anomaly_summary():
         }},
         {"$sort": {"_id.state": 1}},
     ]
-    rows = await Anomaly.get_pymongo_collection().aggregate(pipeline).to_list(None)
+    rows = await Anomaly.get_motor_collection().aggregate(pipeline).to_list(None)
 
     # Pivot into {state_name, critical, warning, info, unresolved_total}
     states: dict = {}

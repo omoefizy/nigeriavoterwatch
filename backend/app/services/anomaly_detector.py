@@ -407,14 +407,25 @@ class AnomalyDetector:
     # ── C6: EC8A image hash changed after first upload (CRITICAL) ────────────
 
     async def _c6_image_hash_changed(self, elections: list[Election]) -> list[Anomaly]:
+        # Scrape entries carry IReV's election id. Group per (election, PU) so the
+        # same polling unit appearing in two different elections (each with its
+        # own EC8A) is never mistaken for a replaced image, and attribute each
+        # finding only to the election it was scraped for.
+        by_irev_id = {e.irev_election_id: e for e in elections if e.irev_election_id}
+        if not by_irev_id:
+            log.info("AnomalyDetector C6: no active election has irev_election_id, skipping")
+            return []
+
         pipeline = [
             {"$match": {
+                "election_id": {"$in": list(by_irev_id)},
                 "image_downloaded": True,
                 "pu_code": {"$ne": None},
                 "image_hash_sha256": {"$ne": None},
             }},
+            {"$sort": {"scraped_at": 1}},  # makes $first / $last chronological
             {"$group": {
-                "_id": "$pu_code",
+                "_id": {"election_id": "$election_id", "pu_code": "$pu_code"},
                 "unique_hashes": {"$addToSet": "$image_hash_sha256"},
                 "first_hash": {"$first": "$image_hash_sha256"},
                 "last_hash": {"$last": "$image_hash_sha256"},
@@ -429,42 +440,44 @@ class AnomalyDetector:
             {"$match": {"unique_hashes.1": {"$exists": True}}},
         ]
 
-        changed = await ScrapeLogEntry.get_pymongo_collection().aggregate(pipeline).to_list(None)
+        changed = await ScrapeLogEntry.get_motor_collection().aggregate(pipeline).to_list(None)
         if not changed:
             return []
 
         anomalies: list[Anomaly] = []
 
         for doc in changed:
-            pu_code = doc["_id"]
+            irev_election_id = doc["_id"]["election_id"]
+            pu_code = doc["_id"]["pu_code"]
+            election = by_irev_id[irev_election_id]
             pu = await PollingUnit.find_one({"inec_pu_code": pu_code})
             pu_id = pu.id if pu else None
 
-            for election in elections:
-                if self._is_duplicate(election.id, pu_id, AnomalyType.IMAGE_HASH_CHANGED):
-                    continue
-                anomalies.append(Anomaly(
-                    election_id=election.id,
-                    polling_unit_id=pu_id,
-                    anomaly_type=AnomalyType.IMAGE_HASH_CHANGED,
-                    severity=AnomalySeverity.CRITICAL,
-                    description=(
-                        f"EC8A image replaced after initial upload "
-                        f"at {doc.get('pu_name') or pu_code} "
-                        f"({len(doc['unique_hashes'])} distinct hashes detected)"
-                    ),
-                    details={
-                        "pu_code": pu_code,
-                        "unique_hash_count": len(doc["unique_hashes"]),
-                        "first_hash": doc["first_hash"],
-                        "last_hash": doc["last_hash"],
-                        "first_scraped": doc["first_scraped"].isoformat() if doc.get("first_scraped") else None,
-                        "last_scraped": doc["last_scraped"].isoformat() if doc.get("last_scraped") else None,
-                    },
-                    state_name=doc.get("state_name"),
-                    lga_name=doc.get("lga_name"),
-                    ward_name=doc.get("ward_name"),
-                ))
+            if self._is_duplicate(election.id, pu_id, AnomalyType.IMAGE_HASH_CHANGED):
+                continue
+            anomalies.append(Anomaly(
+                election_id=election.id,
+                polling_unit_id=pu_id,
+                anomaly_type=AnomalyType.IMAGE_HASH_CHANGED,
+                severity=AnomalySeverity.CRITICAL,
+                description=(
+                    f"EC8A image replaced after initial upload "
+                    f"at {doc.get('pu_name') or pu_code} "
+                    f"({len(doc['unique_hashes'])} distinct hashes detected)"
+                ),
+                details={
+                    "pu_code": pu_code,
+                    "irev_election_id": irev_election_id,
+                    "unique_hash_count": len(doc["unique_hashes"]),
+                    "first_hash": doc["first_hash"],
+                    "last_hash": doc["last_hash"],
+                    "first_scraped": doc["first_scraped"].isoformat() if doc.get("first_scraped") else None,
+                    "last_scraped": doc["last_scraped"].isoformat() if doc.get("last_scraped") else None,
+                },
+                state_name=doc.get("state_name"),
+                lga_name=doc.get("lga_name"),
+                ward_name=doc.get("ward_name"),
+            ))
 
         return anomalies
 

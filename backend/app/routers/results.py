@@ -171,7 +171,7 @@ async def election_summary(election_id: str):
             }
         },
     ]
-    agg = await ElectionResult.get_pymongo_collection().aggregate(pipeline).to_list(None)
+    agg = await ElectionResult.get_motor_collection().aggregate(pipeline).to_list(None)
     totals = agg[0] if agg else {}
 
     # Tally party votes in Python (parties are typically < 10)
@@ -185,7 +185,7 @@ async def election_summary(election_id: str):
         {"$match": {"election_id": election_oid}},
         {"$group": {"_id": "$status", "count": {"$sum": 1}}},
     ]
-    status_agg = await ElectionResult.get_pymongo_collection().aggregate(status_pipeline).to_list(None)
+    status_agg = await ElectionResult.get_motor_collection().aggregate(status_pipeline).to_list(None)
     results_by_status = {row["_id"]: row["count"] for row in status_agg}
 
     return ElectionSummaryRead(
