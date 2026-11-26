@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useMemo } from "react";
 import { MapContainer, TileLayer, GeoJSON, useMap } from "react-leaflet";
 import { useQuery } from "@tanstack/react-query";
-import { getElections, getUploadByState, getLGAs } from "../services/api";
+import { getElections, getUploadByState, getLGAs, getStates } from "../services/api";
 
 // ── Colour scale: red (0%) → amber (50%) → green (100%) ────────────────────
 function pctToColor(pct) {
@@ -25,6 +25,24 @@ const LEGEND_ROWS = [
 // Normalise state names for fuzzy matching
 function norm(s) {
   return (s ?? "").toLowerCase().replace(/[^a-z]/g, "");
+}
+
+// "lagos" / "AKWA IBOM" → "Lagos" / "Akwa Ibom"
+function toTitleCase(s) {
+  return s.toLowerCase().replace(/\b([a-z])/g, (c) => c.toUpperCase());
+}
+
+// Label for the summary panel: the state the loaded election(s) cover, or the
+// election name(s) when there is no single state.
+function scopeLabel(elections, states) {
+  if (!elections.length) return null;
+  const stateNameById = Object.fromEntries(states.map((s) => [s.id, s.name]));
+  const stateNames = elections.map(
+    (e) => e.state_name ?? stateNameById[e.scope_state_id] ?? null
+  );
+  const distinct = [...new Set(stateNames)];
+  if (distinct.length === 1 && distinct[0]) return toTitleCase(distinct[0]);
+  return [...new Set(elections.map((e) => e.name))].join(" / ");
 }
 
 // FlyTo helper — must be used inside MapContainer
@@ -54,6 +72,15 @@ export default function MapPage() {
     queryKey: ["elections"],
     queryFn: () => getElections({ page_size: 100 }),
   });
+  const elections = electionsData?.items ?? [];
+
+  // States (to turn an election's scope_state_id into a name)
+  const { data: states = [] } = useQuery({
+    queryKey: ["states"],
+    queryFn: getStates,
+  });
+
+  const scope = scopeLabel(elections, states);
 
   // Upload stats by state
   const { data: uploadStats = [] } = useQuery({
@@ -171,8 +198,8 @@ export default function MapPage() {
           {/* Summary totals */}
           {uploadStats.length > 0 && (
             <div>
-              <h3>National summary</h3>
-              <NationalSummary stats={uploadStats} />
+              {scope && <h3>{scope} summary</h3>}
+              <ScopeSummary stats={uploadStats} scope={scope} />
             </div>
           )}
 
@@ -212,7 +239,7 @@ export default function MapPage() {
   );
 }
 
-function NationalSummary({ stats }) {
+function ScopeSummary({ stats, scope }) {
   const total      = stats.reduce((s, r) => s + (r.total      ?? 0), 0);
   const downloaded = stats.reduce((s, r) => s + (r.downloaded ?? 0), 0);
   const missing    = stats.reduce((s, r) => s + (r.missing    ?? 0), 0);
@@ -220,7 +247,7 @@ function NationalSummary({ stats }) {
 
   return (
     <div style={{ marginTop: "0.4rem" }}>
-      <div className="map-info-row"><span>National upload</span><strong>{pct}%</strong></div>
+      <div className="map-info-row"><span>{scope ? `${scope} upload` : "Upload"}</span><strong>{pct}%</strong></div>
       <div className="map-info-row"><span>PUs with image</span><span>{downloaded.toLocaleString()}</span></div>
       <div className="map-info-row"><span>PUs visited</span><span>{total.toLocaleString()}</span></div>
       <div className="map-info-row"><span>Missing</span><span>{missing.toLocaleString()}</span></div>
