@@ -32,15 +32,25 @@ jobs:
           cache: pip
           cache-dependency-path: backend/requirements.txt
 
-      # Install only what the hash chain module needs — no Playwright/Tesseract.
+      # Install only what the hash chain module and tests/conftest.py need —
+      # no Playwright/Tesseract. Versions mirror backend/requirements.txt.
+      #   conftest (module level): pytest-asyncio
+      #   conftest mock_db fixture: beanie, motor, pymongo, mongomock-motor
+      #   app.config / hash_chain: pydantic, pydantic-settings, python-dotenv
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install \
-            pydantic==2.10.3 \
-            pydantic-settings==2.7.0 \
+            pydantic==2.5.3 \
+            pydantic-core==2.14.6 \
+            pydantic-settings==2.1.0 \
             python-dotenv==1.0.1 \
             pytest==8.3.4 \
+            pytest-asyncio==0.24.0 \
+            motor==3.6.0 \
+            pymongo==4.9.2 \
+            beanie==1.26.0 \
+            mongomock-motor==0.0.36 \
             structlog==24.4.0
 
       - name: Run hash chain tests
